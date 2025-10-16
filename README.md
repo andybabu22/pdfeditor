@@ -1,19 +1,22 @@
-# pdfeditor
+# pdfeditor (Unicode-safe)
 
-Dual‑mode PDF phone number replacer. Paste multiple PDF URLs, enter a replacement number, and download edited PDFs (single or ZIP). Works on Vercel.
+Vercel-ready Next.js app that replaces phone numbers in PDFs.
+- Local mode (regex + normalization) — no API key needed
+- AI mode (GPT-5) — set OPENAI_API_KEY in `.env.local`
+- Unicode font is fetched **at runtime** (no local font files)
 
-## Modes
-- **Local Detection (default):** regex + normalization, no API key required.
-- **AI Mode (optional):** GPT‑5 for semantic detection. Add `.env.local` with `OPENAI_API_KEY`.
+## Deploy steps
+1) Push to GitHub
+2) On Vercel:
+   - Framework Preset: Next.js
+   - Root Directory: repo root (folder containing `pages/` and `package.json`)
+   - Build Command: `npm run build`
+   - Output Directory: **leave blank**
+   - Redeploy (clear build cache if needed)
 
-## Setup
+## Dev
 ```bash
 npm install
 npm run dev
-# optional: cp .env.local.example .env.local and set your key
-vercel deploy
 ```
 
-## Notes
-- This demo overlays replaced text chunk onto the first page to produce a downloadable edited PDF quickly.
-- In‑place replacement within the original layout requires a more advanced text positioning pipeline (pdf.js text spans + reflow), which can be added later.

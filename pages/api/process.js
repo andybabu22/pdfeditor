@@ -1,7 +1,11 @@
-import { PDFDocument, StandardFonts } from "pdf-lib";
+import { PDFDocument } from "pdf-lib";
 import pdfParse from "pdf-parse";
+import fontkit from "@pdf-lib/fontkit";
 
 export const config = { api: { bodyParser: true, sizeLimit: "25mb" } };
+
+// Unicode font served from a public GitHub repo (no local files required)
+const FONT_URL = "https://raw.githubusercontent.com/GreatWizard/notosans-fontface/master/fonts/NotoSans-Regular.ttf";
 
 export default async function handler(req, res) {
   try {
@@ -22,19 +26,25 @@ export default async function handler(req, res) {
 
     const newText = normalize(text).replace(phoneRegex, newNumber);
 
-    // overlay replaced text chunk onto first page (simple preview/output)
+    // Load original PDF & embed a Unicode font (fixes ℗/®/™ etc.)
     const pdfDoc = await PDFDocument.load(pdfData);
-    const firstPage = pdfDoc.getPages()[0];
-    const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    pdfDoc.registerFontkit(fontkit);
 
+    const fontRes = await fetch(FONT_URL, { cache: "no-store" });
+    if (!fontRes.ok) throw new Error(`Font download failed (${fontRes.status})`);
+    const fontBytes = new Uint8Array(await fontRes.arrayBuffer());
+    const unicodeFont = await pdfDoc.embedFont(fontBytes, { subset: true });
+
+    const page = pdfDoc.getPages()[0];
     const previewChunk = newText.slice(0, 1800);
-    firstPage.drawText(previewChunk, {
+
+    page.drawText(previewChunk, {
       x: 36,
-      y: firstPage.getHeight() - 72,
+      y: page.getHeight() - 72,
       size: 10,
       lineHeight: 12,
-      font,
-      maxWidth: firstPage.getWidth() - 72,
+      font: unicodeFont,
+      maxWidth: page.getWidth() - 72,
     });
 
     const outPdf = await pdfDoc.save();
