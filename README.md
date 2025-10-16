@@ -1,4 +1,4 @@
-# pdfeditor (Unicode-safe)
+# pdfeditor by andy (Unicode-safe)
 
 Vercel-ready Next.js app that replaces phone numbers in PDFs.
 - Local mode (regex + normalization) — no API key needed
