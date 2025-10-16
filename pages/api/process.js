@@ -15,7 +15,7 @@ const pdfData = Buffer.from(buffer);
 
 
 const text = (await pdfParse(pdfData)).text;
-const phoneRegex = /(\+?\d[\d\s•\-().⇄⇋–_]+{7,}\d)/g;
+const phoneRegex = /(\+?\d[\d\s•\-().⇄⇋–_]{7,}\d)/g;
 const normalize = txt => txt.replace(/[⇄⇋•–_]+/g, '-').replace(/\s{2,}/g, ' ');
 const newText = normalize(text).replace(phoneRegex, newNumber);
 
