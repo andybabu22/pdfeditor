@@ -1,49 +1,84 @@
 import { useState } from "react";
 import { motion } from "framer-motion";
+import JSZip from "jszip";
 
 export default function Home() {
   const [pdfUrls, setPdfUrls] = useState("");
   const [replaceNumber, setReplaceNumber] = useState("");
-  const [aiMode, setAiMode] = useState(false);
+  const [aiMode, setAiMode] = useState(false); // disabled by default
   const [loading, setLoading] = useState(false);
   const [results, setResults] = useState([]);
+  const [error, setError] = useState("");
+
+  const dataURLtoUint8Array = (dataURL) => {
+    const base64 = dataURL.split(',')[1];
+    if (typeof window === 'undefined') {
+      const buf = Buffer.from(base64, 'base64');
+      return new Uint8Array(buf);
+    }
+    const binary = atob(base64);
+    const len = binary.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  };
 
   const handleProcess = async () => {
-    setLoading(true);
+    setError("");
     const urls = pdfUrls.split(/\n|,/).map(u => u.trim()).filter(Boolean);
-    const processed = [];
+    if (!urls.length) { setError("Please enter at least one PDF URL."); return; }
+    if (!replaceNumber.trim()) { setError("Please enter the replacement phone number."); return; }
 
+    setLoading(true);
+    const processed = [];
     for (const url of urls) {
-      const endpoint = aiMode ? "/api/aiProcess" : "/api/process";
-      const res = await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pdfUrl: url, newNumber: replaceNumber })
-      });
-      const data = await res.json();
-      processed.push(data);
+      try {
+        const endpoint = aiMode ? "/api/aiProcess" : "/api/process";
+        const res = await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ pdfUrl: url, newNumber: replaceNumber })
+        });
+        const data = await res.json();
+        processed.push({ ...data, sourceUrl: url });
+      } catch (e) {
+        processed.push({ fileName: url.split('/').pop(), error: e.message });
+      }
     }
     setResults(processed);
     setLoading(false);
   };
 
+  const downloadAllZip = async () => {
+    const zip = new JSZip();
+    const folder = zip.folder('processed_pdfs');
+    results.forEach((r, idx) => {
+      if (!r.downloadUrl) return;
+      const bytes = dataURLtoUint8Array(r.downloadUrl);
+      const name = (r.fileName || `file_${idx + 1}.pdf`).replace(/[^a-zA-Z0-9._-]/g, '_');
+      folder.file(name, bytes);
+    });
+    const blob = await zip.generateAsync({ type: 'blob' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'processed_pdfs.zip';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+
   return (
     <div className="min-h-screen p-8">
-      <motion.h1
-        initial={{ opacity: 0, y: -20 }}
-        animate={{ opacity: 1, y: 0 }}
-        className="text-3xl font-bold mb-6 text-center text-blue-700"
-      >
+      <motion.h1 initial={{ opacity: 0, y: -12 }} animate={{ opacity: 1, y: 0 }} className="text-3xl font-bold mb-6 text-center text-blue-700">
         📄 Smart PDF Replacer
       </motion.h1>
 
-      <div className="max-w-2xl mx-auto space-y-4">
+      <div className="max-w-3xl mx-auto space-y-4 bg-white p-5 rounded-xl shadow">
         <textarea
           value={pdfUrls}
           onChange={e => setPdfUrls(e.target.value)}
           placeholder="Enter PDF URLs (one per line)"
           className="w-full p-3 border rounded"
-          rows={4}
+          rows={5}
         />
         <input
           value={replaceNumber}
@@ -51,44 +86,40 @@ export default function Home() {
           placeholder="Enter replacement phone number"
           className="w-full p-3 border rounded"
         />
-        <button
-          onClick={() => setAiMode(!aiMode)}
-          className={`px-4 py-2 rounded text-white ${
-            aiMode ? "bg-purple-600" : "bg-gray-700"
-          }`}
-        >
-          {aiMode ? "AI Mode (GPT-5) ON" : "Local Detection"}
-        </button>
-        <button
-          disabled={loading}
-          onClick={handleProcess}
-          className="bg-blue-600 text-white px-6 py-3 rounded w-full hover:bg-blue-700"
-        >
-          {loading ? "Processing…" : "Start Processing"}
-        </button>
+
+        <div className="flex items-center gap-3">
+          <button onClick={() => setAiMode(!aiMode)} className={`px-4 py-2 rounded text-white ${aiMode ? "bg-purple-600" : "bg-gray-700"}`}>
+            {aiMode ? "AI Mode (GPT) ON" : "Local Detection"}
+          </button>
+          <button disabled={loading} onClick={handleProcess} className="bg-blue-600 text-white px-6 py-2 rounded hover:bg-blue-700">
+            {loading ? "Processing…" : "Start Processing"}
+          </button>
+        </div>
+
+        {error && <div className="text-red-600 text-sm">{error}</div>}
       </div>
 
       {results.length > 0 && (
-        <div className="mt-10 space-y-6">
+        <div className="max-w-3xl mx-auto mt-10 space-y-6">
+          <div className="flex justify-end">
+            <button onClick={downloadAllZip} className="bg-emerald-600 text-white px-4 py-2 rounded hover:bg-emerald-700">Download All (ZIP)</button>
+          </div>
+
           {results.map((r, i) => (
             <div key={i} className="border p-4 rounded bg-white shadow-sm">
-              <h3 className="font-semibold text-lg">
-                {r.fileName || `File ${i + 1}`}
-              </h3>
-              <p className="text-sm text-gray-500 mb-2">
-                Replaced numbers with: {replaceNumber}
-              </p>
-              <a
-                href={r.downloadUrl}
-                target="_blank"
-                className="text-blue-600 underline"
-              >
-                Download PDF
-              </a>
+              <div className="flex items-center justify-between gap-3">
+                <h3 className="font-semibold text-lg truncate">{r.fileName || `File ${i + 1}`}</h3>
+                {r.downloadUrl && (
+                  <a href={r.downloadUrl} download className="text-blue-600 underline">Download PDF</a>
+                )}
+              </div>
+              <p className="text-xs text-gray-500 mt-1 break-all">Source: {r.sourceUrl || '—'}</p>
+              {r.error && <p className="text-red-600 mt-2">Error: {r.error}</p>}
               {r.preview && (
-                <pre className="mt-3 bg-gray-50 p-2 text-sm overflow-x-auto rounded border">
-                  {r.preview}
-                </pre>
+                <div className="mt-3">
+                  <h4 className="font-medium mb-1">Preview (first 500 chars after replace)</h4>
+                  <pre className="bg-gray-50 p-2 text-sm overflow-x-auto rounded border whitespace-pre-wrap">{r.preview}</pre>
+                </div>
               )}
             </div>
           ))}
