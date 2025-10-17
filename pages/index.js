@@ -1,238 +1,365 @@
-// pages/api/process.js
-import { PDFDocument } from "pdf-lib";
-import pdfParse from "pdf-parse";
-import fontkit from "@pdf-lib/fontkit";
+// pages/index.js
+import { useState } from "react";
+import { motion } from "framer-motion";
+import JSZip from "jszip";
 
-export const config = { api: { bodyParser: true, sizeLimit: "25mb" } };
-
-// Unicode font fetched at runtime (handles ℗, ™, ®, etc.)
+// Unicode font for drawing replacements (browser fetch)
 const FONT_URL =
   "https://raw.githubusercontent.com/GreatWizard/notosans-fontface/master/fonts/NotoSans-Regular.ttf";
 
-// -------- Helpers --------
-function normalizeWeird(text) {
-  return text
-    .replace(/[\u200B-\u200D\uFEFF\u00AD]/g, "") // zero-width + soft hyphen
-    .replace(/[⇄⇋•·–—_]+/g, "-")                // unify odd separators
+// Detection helpers (same logic client-side)
+const PHONE_RE = /(\+?\d[\d\s\-().]{7,}\d)/g;
+const normalizeWeird = (text) =>
+  text
+    .replace(/[\u200B-\u200D\uFEFF\u00AD]/g, "")
+    .replace(/[⇄⇋•·–—_]+/g, "-")
     .replace(/\s{2,}/g, " ")
     .trim();
-}
-// Phone-like sequences: allow separators and parens; aim for at least ~9 digits total
-const PHONE_RE = /(\+?\d[\d\s\-().]{7,}\d)/g;
 
-async function embedUnicodeFont(pdfDoc) {
-  pdfDoc.registerFontkit(fontkit);
-  const r = await fetch(FONT_URL, { cache: "no-store" });
-  if (!r.ok) throw new Error(`Font download failed (${r.status})`);
-  const bytes = new Uint8Array(await r.arrayBuffer());
-  return pdfDoc.embedFont(bytes, { subset: true });
-}
+export default function Home() {
+  const [pdfUrls, setPdfUrls] = useState("");
+  const [replaceNumber, setReplaceNumber] = useState("");
+  const [aiMode, setAiMode] = useState(false);
+  const [keepLayout, setKeepLayout] = useState(true);
 
-/** Load pdfjs-dist in a way that works across versions/builds.
- *  - Try ESM root first (v4+)
- *  - Fallback to legacy mjs build
- */
-async function loadPdfJs() {
-  try {
-    const mod = await import("pdfjs-dist");
-    if (mod?.getDocument) return { getDocument: mod.getDocument };
-    if (mod?.default?.getDocument) return { getDocument: mod.default.getDocument };
-  } catch (_) {}
-  try {
-    const mod = await import("pdfjs-dist/legacy/build/pdf.mjs");
-    if (mod?.getDocument) return { getDocument: mod.getDocument };
-    if (mod?.default?.getDocument) return { getDocument: mod.default.getDocument };
-  } catch (e) {
-    // Final throw with helpful message
-    throw new Error(
-      `Unable to load pdfjs-dist. Make sure "pdfjs-dist" is in dependencies. Original error: ${e?.message || e}`
-    );
-  }
-  throw new Error("pdfjs-dist loaded but getDocument was not found.");
-}
+  const [loading, setLoading] = useState(false);
+  const [results, setResults] = useState([]);
+  const [error, setError] = useState("");
 
-// ------- IN-PLACE (keep layout) -------
-async function inplaceReplace(pdfBytes, newNumber) {
-  // Copy original pages first
-  const srcDoc = await PDFDocument.load(pdfBytes);
-  const outDoc = await PDFDocument.create();
-  const copied = await outDoc.copyPages(srcDoc, srcDoc.getPageIndices());
-  copied.forEach((p) => outDoc.addPage(p));
-  const font = await embedUnicodeFont(outDoc);
+  const [progressTotal, setProgressTotal] = useState(0);
+  const [progressDone, setProgressDone] = useState(0);
+  const percent = progressTotal ? Math.round((progressDone / progressTotal) * 100) : 0;
 
-  // ✅ Dynamic import (no static 'pdf.js' anywhere)
-  const { getDocument } = await loadPdfJs();
+  const [openPreview, setOpenPreview] = useState({});
+  const togglePreview = (idx) => setOpenPreview((p) => ({ ...p, [idx]: !p[idx] }));
 
-  // Parse with pdf.js (no worker in serverless)
-  const loadingTask = getDocument({ data: pdfBytes, disableWorker: true });
-  const jsDoc = await loadingTask.promise;
-  const pageCount = jsDoc.numPages;
+  const dataURLtoUint8Array = (dataURL) => {
+    const base64 = dataURL.split(",")[1];
+    const binary = atob(base64);
+    const len = binary.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  };
 
-  const LINE_Y_TOL = 2.0;
-  const WORD_GAP_TOL = 2.0;
-  const PAD = 1.5;
-  const DRAW_SIZE = 10;
+  const arrayBufferToDataUrl = (mime, ab) => {
+    const bytes = new Uint8Array(ab);
+    let bin = "";
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    const base64 = btoa(bin);
+    return `data:${mime};base64,${base64}`;
+  };
 
-  for (let i = 1; i <= pageCount; i++) {
-    const jsPage = await jsDoc.getPage(i);
-    const viewport = jsPage.getViewport({ scale: 1.0 });
-    const content = await jsPage.getTextContent({ disableCombineTextItems: false });
+  // ---- CLIENT-SIDE IN-PLACE (Keep Layout) ----
+  const processInplaceClient = async (pdfArrayBuffer, newNumber) => {
+    const [{ PDFDocument }, fontkit, pdfjs] = await Promise.all([
+      import("pdf-lib"),
+      import("@pdf-lib/fontkit"),
+      // Use root ESM build; works well on client
+      import("pdfjs-dist")
+    ]);
 
-    // Group items into lines
-    const lines = [];
-    for (const it of content.items) {
-      const [a,b,c,d,e,f] = it.transform;
-      const x = e;
-      const y = f;
-      const width = it.width;
-      const height = it.height || Math.hypot(c, d);
-      let line = lines.find(L => Math.abs(L.yRef - y) <= LINE_Y_TOL);
-      if (!line) { line = { yRef: y, items: [] }; lines.push(line); }
-      line.items.push({ str: it.str, x, y, width, height });
-    }
-    lines.sort((L1, L2) => L2.yRef - L1.yRef);             // top → bottom
-    lines.forEach(L => L.items.sort((a,b) => a.x - b.x));   // left → right
+    // Load source in both pdf-lib (for drawing) and pdfjs (for text positions)
+    const srcBytes = new Uint8Array(pdfArrayBuffer);
+    const pdfDoc = await PDFDocument.load(srcBytes);
+    pdfDoc.registerFontkit(fontkit.default || fontkit);
+    const fontRes = await fetch(FONT_URL, { cache: "no-store" });
+    const fontBytes = new Uint8Array(await fontRes.arrayBuffer());
+    const uniFont = await pdfDoc.embedFont(fontBytes, { subset: true });
 
-    // Build plain text per line + spans mapping
-    for (const L of lines) {
-      let text = "";
-      const spans = []; // { start, end, itemIndex }
-      for (let idx = 0; idx < L.items.length; idx++) {
-        const it = L.items[idx];
-        if (idx > 0) {
-          const prev = L.items[idx - 1];
-          const gap = it.x - (prev.x + prev.width);
-          if (gap > WORD_GAP_TOL) { spans.push({ start: text.length, end: text.length + 1, itemIndex: -1 }); text += " "; }
-        }
-        const start = text.length;
-        text += it.str;
-        spans.push({ start, end: text.length, itemIndex: idx });
+    const loadingTask = pdfjs.getDocument({ data: srcBytes, disableWorker: true });
+    const jsDoc = await loadingTask.promise;
+
+    const PAD = 1.5;
+    const LINE_Y_TOL = 2.0;
+    const WORD_GAP_TOL = 2.0;
+    const DRAW_SIZE = 10;
+
+    for (let i = 1; i <= jsDoc.numPages; i++) {
+      const jsPage = await jsDoc.getPage(i);
+      const viewport = jsPage.getViewport({ scale: 1.0 });
+      const content = await jsPage.getTextContent({ disableCombineTextItems: false });
+
+      // group into lines
+      const lines = [];
+      for (const it of content.items) {
+        const [a,b,c,d,e,f] = it.transform;
+        const x = e;
+        const y = f;
+        const width = it.width;
+        const height = it.height || Math.hypot(c, d);
+        let line = lines.find(L => Math.abs(L.yRef - y) <= LINE_Y_TOL);
+        if (!line) { line = { yRef: y, items: [] }; lines.push(line); }
+        line.items.push({ str: it.str, x, y, width, height });
       }
-      L.text = text;
-      L.spans = spans;
-    }
+      lines.sort((L1, L2) => L2.yRef - L1.yRef);
+      lines.forEach(L => L.items.sort((a,b) => a.x - b.x));
 
-    const pdfPage = outDoc.getPage(i - 1);
-    const pageW = pdfPage.getWidth();
-    const pageH = pdfPage.getHeight();
-    const scaleX = pageW / viewport.width;
-    const scaleY = pageH / viewport.height;
-
-    // Find matches and overlay
-    for (const L of lines) {
-      const raw = L.text || "";
-      if (!raw) continue;
-
-      let m;
-      while ((m = PHONE_RE.exec(raw)) !== null) {
-        const mStart = m.index;
-        const mEnd = m.index + m[0].length;
-
-        // Which items contribute to the match?
-        const usedItems = [];
-        for (const s of L.spans) {
-          if (s.itemIndex < 0) continue;              // inserted space
-          if (s.start < mEnd && s.end > mStart) {     // overlap
-            usedItems.push(L.items[s.itemIndex]);
+      // build text + spans
+      for (const L of lines) {
+        let text = "";
+        const spans = [];
+        for (let idx = 0; idx < L.items.length; idx++) {
+          const it = L.items[idx];
+          if (idx > 0) {
+            const prev = L.items[idx - 1];
+            const gap = it.x - (prev.x + prev.width);
+            if (gap > WORD_GAP_TOL) { spans.push({ start: text.length, end: text.length + 1, itemIndex: -1 }); text += " "; }
           }
+          const start = text.length;
+          text += it.str;
+          spans.push({ start, end: text.length, itemIndex: idx });
         }
-        if (!usedItems.length) continue;
+        L.text = text;
+        L.spans = spans;
+      }
 
-        // Bounding box in pdf.js coords
-        const minX = Math.min(...usedItems.map(u => u.x)) - PAD;
-        const maxX = Math.max(...usedItems.map(u => u.x + u.width)) + PAD;
-        const topY = Math.max(...usedItems.map(u => u.y)) + PAD;
-        const bottomY = Math.min(...usedItems.map(u => u.y - u.height)) - PAD;
+      const page = pdfDoc.getPage(i - 1);
+      const pageW = page.getWidth();
+      const pageH = page.getHeight();
+      const scaleX = pageW / viewport.width;
+      const scaleY = pageH / viewport.height;
 
-        // Convert to pdf-lib coords
-        const pdfX = minX * scaleX;
-        const pdfWidth = (maxX - minX) * scaleX;
-        const pdfTopFromBottom = pageH - (topY * scaleY);
-        const pdfHeight = (topY - bottomY) * scaleY;
-        const pdfY = pdfTopFromBottom - pdfHeight;
+      for (const L of lines) {
+        const raw = L.text || "";
+        if (!raw) continue;
 
-        // White cover
-        pdfPage.drawRectangle({
-          x: pdfX,
-          y: pdfY,
-          width: pdfWidth,
-          height: pdfHeight,
-          color: { type: "RGB", r: 1, g: 1, b: 1 }
-        });
+        let m;
+        while ((m = PHONE_RE.exec(raw)) !== null) {
+          const mStart = m.index;
+          const mEnd = m.index + m[0].length;
 
-        // Replacement text
-        pdfPage.drawText(newNumber, {
-          x: pdfX + 0.5,
-          y: pdfY + 0.5,
-          size: DRAW_SIZE,
-          font,
-          maxWidth: pdfWidth - 1
-        });
+          const usedItems = [];
+          for (const s of L.spans) {
+            if (s.itemIndex < 0) continue;
+            if (s.start < mEnd && s.end > mStart) usedItems.push(L.items[s.itemIndex]);
+          }
+          if (!usedItems.length) continue;
+
+          const minX = Math.min(...usedItems.map(u => u.x)) - PAD;
+          const maxX = Math.max(...usedItems.map(u => u.x + u.width)) + PAD;
+          const topY = Math.max(...usedItems.map(u => u.y)) + PAD;
+          const bottomY = Math.min(...usedItems.map(u => u.y - u.height)) - PAD;
+
+          const pdfX = minX * scaleX;
+          const pdfWidth = (maxX - minX) * scaleX;
+          const pdfTopFromBottom = pageH - (topY * scaleY);
+          const pdfHeight = (topY - bottomY) * scaleY;
+          const pdfY = pdfTopFromBottom - pdfHeight;
+
+          // cover + replacement
+          page.drawRectangle({
+            x: pdfX,
+            y: pdfY,
+            width: pdfWidth,
+            height: pdfHeight,
+            color: { type: "RGB", r: 1, g: 1, b: 1 }
+          });
+          page.drawText(replaceNumber, {
+            x: pdfX + 0.5,
+            y: pdfY + 0.5,
+            size: DRAW_SIZE,
+            font: uniFont,
+            maxWidth: pdfWidth - 1
+          });
+        }
       }
     }
-  }
 
-  return await outDoc.save();
-}
+    const out = await pdfDoc.save();
+    return arrayBufferToDataUrl("application/pdf", out);
+  };
 
-// ------- Overlay (quick preview on page 1) -------
-async function overlayPreview(pdfBytes, newNumber) {
-  const text = (await pdfParse(pdfBytes)).text || "";
-  const replaced = normalizeWeird(text).replace(PHONE_RE, newNumber);
-  const pdfDoc = await PDFDocument.load(pdfBytes);
-  const font = await embedUnicodeFont(pdfDoc);
-  const page = pdfDoc.getPages()[0];
-  const chunk = replaced.slice(0, 1800);
-  page.drawText(chunk, {
-    x: 36,
-    y: page.getHeight() - 72,
-    size: 10,
-    lineHeight: 12,
-    font,
-    maxWidth: page.getWidth() - 72
-  });
-  return await pdfDoc.save();
-}
+  const handleProcess = async () => {
+    setError("");
+    setResults([]);
+    setProgressDone(0);
+    setOpenPreview({});
 
-// ------- Rebuild (plain text PDF) -------
-async function rebuildPdf(pdfBytes, newNumber) {
-  const out = await PDFDocument.create();
-  const font = await embedUnicodeFont(out);
-  const text = (await pdfParse(pdfBytes)).text || "";
-  const replaced = normalizeWeird(text).replace(PHONE_RE, newNumber);
-  const page = out.addPage([612, 792]); // Letter
-  page.drawText(replaced.slice(0, 8000), {
-    x: 36, y: 792 - 72, size: 10, lineHeight: 12, font, maxWidth: 612 - 72
-  });
-  return await out.save();
-}
+    const urls = pdfUrls.split(/\n|,/).map((u) => u.trim()).filter(Boolean);
+    if (!urls.length) { setError("Please enter at least one PDF URL."); return; }
+    if (!replaceNumber.trim()) { setError("Please enter the replacement phone number."); return; }
 
-// --------------- API handler ----------------
-export default async function handler(req, res) {
-  try {
-    const { pdfUrl, newNumber, mode = "inplace" } = req.body || {};
-    if (!pdfUrl || !newNumber) {
-      return res.status(400).json({ error: "Missing pdfUrl or newNumber" });
+    setProgressTotal(urls.length);
+    setLoading(true);
+
+    const processed = [];
+    for (let i = 0; i < urls.length; i++) {
+      const url = urls[i];
+      try {
+        let data;
+        if (keepLayout) {
+          // In-place on client: fetch via proxy to avoid CORS
+          const proxied = `/api/fetch?url=${encodeURIComponent(url)}`;
+          const r = await fetch(proxied);
+          if (!r.ok) throw new Error(`Fetch failed (${r.status})`);
+          const arrBuf = await r.arrayBuffer();
+          const downloadUrl = await processInplaceClient(arrBuf, replaceNumber);
+          data = {
+            fileName: url.split("/").pop() || `file_${i + 1}.pdf`,
+            preview: "In-place replacement complete (layout preserved).",
+            downloadUrl
+          };
+        } else {
+          // Rebuild/Overlay handled on the server (no pdfjs-dist on server)
+          const endpoint = aiMode ? "/api/aiProcess" : "/api/process";
+          const res = await fetch(endpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              pdfUrl: url,
+              newNumber: replaceNumber,
+              mode: "rebuild" // or "overlay" if you want quick preview
+            }),
+          });
+          data = await res.json();
+        }
+
+        processed.push({ ...data, sourceUrl: url });
+      } catch (e) {
+        processed.push({
+          fileName: url.split("/").pop() || `file_${i + 1}.pdf`,
+          sourceUrl: url,
+          error: e.message || String(e),
+        });
+      }
+
+      setProgressDone((prev) => prev + 1);
     }
 
-    const resp = await fetch(pdfUrl);
-    if (!resp.ok) throw new Error(`Failed to fetch PDF (${resp.status})`);
-    const pdfBytes = Buffer.from(await resp.arrayBuffer());
+    setResults(processed);
+    setLoading(false);
+  };
 
-    let outBytes;
-    if (mode === "rebuild") outBytes = await rebuildPdf(pdfBytes, newNumber);
-    else if (mode === "overlay") outBytes = await overlayPreview(pdfBytes, newNumber);
-    else outBytes = await inplaceReplace(pdfBytes, newNumber); // default keep layout
-
-    const base64 = Buffer.from(outBytes).toString("base64");
-    res.status(200).json({
-      fileName: (pdfUrl.split("/").pop() || "output.pdf").replace(/[^a-zA-Z0-9._-]/g, "_"),
-      preview: mode === "inplace"
-        ? "In-place replacement complete (layout preserved)."
-        : "Replacement complete.",
-      downloadUrl: `data:application/pdf;base64,${base64}`
+  const downloadAllZip = async () => {
+    const zip = new JSZip();
+    const folder = zip.folder("processed_pdfs");
+    results.forEach((r, idx) => {
+      if (!r.downloadUrl) return;
+      const bytes = dataURLtoUint8Array(r.downloadUrl);
+      const safeName = (r.fileName || `file_${idx + 1}.pdf`).replace(/[^a-zA-Z0-9._-]/g, "_");
+      folder.file(safeName, bytes);
     });
-  } catch (e) {
-    res.status(500).json({ error: e.message || String(e) });
-  }
+    const blob = await zip.generateAsync({ type: "blob" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "processed_pdfs.zip";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+
+  return (
+    <div className="min-h-screen p-8">
+      <motion.h1 initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }}
+        className="text-3xl font-bold mb-6 text-center text-blue-700">
+        📄 Smart PDF Replacer
+      </motion.h1>
+
+      {loading && (
+        <div className="max-w-3xl mx-auto mb-6">
+          <div className="w-full bg-gray-200 h-3 rounded">
+            <div className="h-3 bg-blue-600 rounded transition-all" style={{ width: `${percent}%` }} />
+          </div>
+          <div className="text-sm text-gray-600 mt-1">
+            Processing {progressDone}/{progressTotal} files ({percent}%)
+          </div>
+        </div>
+      )}
+
+      <div className="max-w-3xl mx-auto space-y-4 bg-white p-5 rounded-xl shadow">
+        <label className="block text-sm font-medium text-gray-700">PDF URLs (one per line)</label>
+        <textarea
+          value={pdfUrls}
+          onChange={(e) => setPdfUrls(e.target.value)}
+          placeholder={`https://example.com/file1.pdf
+https://example.com/file2.pdf`}
+          className="w-full p-3 border rounded"
+          rows={6}
+        />
+
+        <label className="block text-sm font-medium text-gray-700">Replacement phone number</label>
+        <input
+          value={replaceNumber}
+          onChange={(e) => setReplaceNumber(e.target.value)}
+          placeholder="+1-999-111-2222"
+          className="w-full p-3 border rounded"
+        />
+
+        <div className="flex flex-wrap items-center gap-3 pt-2">
+          <button onClick={() => setAiMode(!aiMode)}
+            className={`px-4 py-2 rounded text-white ${aiMode ? "bg-purple-600" : "bg-gray-700"}`}
+            title="AI Mode uses your OpenAI key in Vercel → Settings → Environment Variables.">
+            {aiMode ? "AI Mode (GPT) ON" : "Local Detection"}
+          </button>
+
+          <button onClick={() => setKeepLayout(!keepLayout)}
+            className="px-4 py-2 rounded text-white bg-slate-700"
+            title="Keep Layout runs entirely in your browser (no server import).">
+            {keepLayout ? "Layout: Keep (In-place)" : "Layout: Rebuild (Plain Text)"}
+          </button>
+
+          <button disabled={loading} onClick={handleProcess}
+            className="bg-blue-600 text-white px-6 py-2 rounded hover:bg-blue-700 disabled:opacity-60">
+            {loading ? "Processing…" : "Start Processing"}
+          </button>
+        </div>
+
+        {error && <div className="text-red-600 text-sm">{error}</div>}
+
+        <p className="text-xs text-gray-500">
+          Tip: For AI Mode, set <code>OPENAI_API_KEY</code> in Vercel → Project → Settings → Environment Variables.
+        </p>
+      </div>
+
+      {results.length > 0 && (
+        <div className="max-w-3xl mx-auto mt-10 space-y-6">
+          <div className="flex justify-end">
+            <button onClick={downloadAllZip}
+              className="bg-emerald-600 text-white px-4 py-2 rounded hover:bg-emerald-700">
+              Download All (ZIP)
+            </button>
+          </div>
+
+          {results.map((r, i) => (
+            <div key={i} className="border p-4 rounded bg-white shadow-sm">
+              <div className="flex items-center justify-between gap-3">
+                <h3 className="font-semibold text-lg truncate">{r.fileName || `File ${i + 1}`}</h3>
+                <div className="flex items-center gap-3">
+                  {r.downloadUrl && (
+                    <>
+                      <button onClick={() => togglePreview(i)}
+                        className="px-3 py-1 rounded bg-gray-200 hover:bg-gray-300 text-sm">
+                        {openPreview[i] ? "Hide Preview" : "Preview"}
+                      </button>
+                      <a href={r.downloadUrl} download className="text-blue-600 underline">
+                        Download PDF
+                      </a>
+                    </>
+                  )}
+                </div>
+              </div>
+
+              <p className="text-xs text-gray-500 mt-1 break-all">Source: {r.sourceUrl || "—"}</p>
+              {r.error && <p className="text-red-600 mt-2">Error: {r.error}</p>}
+              {r.preview && (
+                <div className="mt-3">
+                  <h4 className="font-medium mb-1">
+                    {keepLayout ? "Preview (layout kept — sample message)" : "Preview (first 500 chars)"}
+                  </h4>
+                  <pre className="bg-gray-50 p-2 text-sm overflow-x-auto rounded border whitespace-pre-wrap">
+                    {r.preview}
+                  </pre>
+                </div>
+              )}
+              {openPreview[i] && r.downloadUrl && (
+                <div className="mt-3">
+                  <iframe src={r.downloadUrl} title={`preview-${i}`} className="w-full h-[480px] border rounded" />
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
