@@ -1,3 +1,12 @@
+// pages/index.js
+// Beginner-friendly UI for Smart PDF Replacer
+// - Paste multiple PDF URLs (one per line)
+// - Enter a replacement number
+// - Choose: Local vs AI mode
+// - Choose: Keep Layout (in-place) vs Rebuild (plain text)
+// - See a progress bar while processing
+// - Download each PDF or Download All (ZIP)
+
 import { useState } from "react";
 import { motion } from "framer-motion";
 import JSZip from "jszip";
@@ -8,10 +17,10 @@ export default function Home() {
   const [replaceNumber, setReplaceNumber] = useState("");
 
   // Toggles
-  const [aiMode, setAiMode] = useState(false);     // OFF by default (no API key needed)
-  const [rebuild, setRebuild] = useState(true);    // REBUILD mode by default (recommended)
+  const [aiMode, setAiMode] = useState(false);   // Local (default) doesn't need an API key
+  const [keepLayout, setKeepLayout] = useState(true); // Keep original layout by default
 
-  // State
+  // State / Output
   const [loading, setLoading] = useState(false);
   const [results, setResults] = useState([]);
   const [error, setError] = useState("");
@@ -21,13 +30,10 @@ export default function Home() {
   const [progressDone, setProgressDone] = useState(0);
   const percent = progressTotal ? Math.round((progressDone / progressTotal) * 100) : 0;
 
-  // Convert data URL -> bytes for JSZip
+  // Convert data URL -> bytes (for zipping)
   const dataURLtoUint8Array = (dataURL) => {
     const base64 = dataURL.split(",")[1];
-    if (typeof window === "undefined") {
-      const buf = Buffer.from(base64, "base64");
-      return new Uint8Array(buf);
-    }
+    // In the browser we have atob:
     const binary = atob(base64);
     const len = binary.length;
     const bytes = new Uint8Array(len);
@@ -40,6 +46,7 @@ export default function Home() {
     setResults([]);
     setProgressDone(0);
 
+    // Clean & split URLs
     const urls = pdfUrls.split(/\n|,/).map(u => u.trim()).filter(Boolean);
     if (!urls.length) { setError("Please enter at least one PDF URL."); return; }
     if (!replaceNumber.trim()) { setError("Please enter the replacement phone number."); return; }
@@ -52,23 +59,30 @@ export default function Home() {
       const url = urls[i];
       try {
         const endpoint = aiMode ? "/api/aiProcess" : "/api/process";
+        const body = {
+          pdfUrl: url,
+          newNumber: replaceNumber,
+          // "inplace" keeps headings/formatting; "rebuild" makes a clean text PDF
+          mode: keepLayout ? "inplace" : "rebuild",
+        };
+
         const res = await fetch(endpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            pdfUrl: url,
-            newNumber: replaceNumber,
-            mode: rebuild ? "rebuild" : "overlay",
-          }),
+          body: JSON.stringify(body),
         });
 
         const data = await res.json();
         processed.push({ ...data, sourceUrl: url });
       } catch (e) {
-        processed.push({ fileName: url.split("/").pop(), sourceUrl: url, error: e.message });
+        processed.push({
+          fileName: url.split("/").pop() || "file.pdf",
+          sourceUrl: url,
+          error: e.message || String(e),
+        });
       }
 
-      // update progress bar
+      // update progress after each file
       setProgressDone(prev => prev + 1);
     }
 
@@ -82,8 +96,8 @@ export default function Home() {
     results.forEach((r, idx) => {
       if (!r.downloadUrl) return;
       const bytes = dataURLtoUint8Array(r.downloadUrl);
-      const name = (r.fileName || `file_${idx + 1}.pdf`).replace(/[^a-zA-Z0-9._-]/g, "_");
-      folder.file(name, bytes);
+      const safeName = (r.fileName || `file_${idx + 1}.pdf`).replace(/[^a-zA-Z0-9._-]/g, "_");
+      folder.file(safeName, bytes);
     });
     const blob = await zip.generateAsync({ type: "blob" });
     const a = document.createElement("a");
@@ -97,7 +111,7 @@ export default function Home() {
     <div className="min-h-screen p-8">
       {/* Title */}
       <motion.h1
-        initial={{ opacity: 0, y: -12 }}
+        initial={{ opacity: 0, y: -10 }}
         animate={{ opacity: 1, y: 0 }}
         className="text-3xl font-bold mb-6 text-center text-blue-700"
       >
@@ -121,38 +135,49 @@ export default function Home() {
 
       {/* Input card */}
       <div className="max-w-3xl mx-auto space-y-4 bg-white p-5 rounded-xl shadow">
+        <label className="block text-sm font-medium text-gray-700">
+          PDF URLs (one per line)
+        </label>
         <textarea
           value={pdfUrls}
           onChange={(e) => setPdfUrls(e.target.value)}
-          placeholder="Enter PDF URLs (one per line)"
+          placeholder="https://example.com/file1.pdf
+https://example.com/file2.pdf"
           className="w-full p-3 border rounded"
-          rows={5}
+          rows={6}
         />
+
+        <label className="block text-sm font-medium text-gray-700">
+          Replacement phone number
+        </label>
         <input
           value={replaceNumber}
           onChange={(e) => setReplaceNumber(e.target.value)}
-          placeholder="Enter replacement phone number"
+          placeholder="+1-999-111-2222"
           className="w-full p-3 border rounded"
         />
 
         {/* Toggles */}
-        <div className="flex flex-wrap items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3 pt-2">
+          {/* AI Mode */}
           <button
             onClick={() => setAiMode(!aiMode)}
             className={`px-4 py-2 rounded text-white ${aiMode ? "bg-purple-600" : "bg-gray-700"}`}
-            title="Use GPT mode (requires OPENAI_API_KEY in Vercel → Settings → Environment Variables)"
+            title="AI Mode uses your OpenAI key in Vercel → Settings → Environment Variables."
           >
             {aiMode ? "AI Mode (GPT) ON" : "Local Detection"}
           </button>
 
+          {/* Layout Mode */}
           <button
-            onClick={() => setRebuild(!rebuild)}
+            onClick={() => setKeepLayout(!keepLayout)}
             className="px-4 py-2 rounded text-white bg-slate-700"
-            title="Rebuild = new PDF from replaced text (recommended). Overlay = stamp preview on page 1."
+            title="Keep Layout = in-place replacement (headings/format preserved). Rebuild = clean text PDF."
           >
-            {rebuild ? "Layout: Rebuild (All Replaced)" : "Layout: Overlay (Preview Only)"}
+            {keepLayout ? "Layout: Keep (In-place)" : "Layout: Rebuild (Plain Text)"}
           </button>
 
+          {/* Start */}
           <button
             disabled={loading}
             onClick={handleProcess}
@@ -162,11 +187,12 @@ export default function Home() {
           </button>
         </div>
 
-        {error && <div className="text-red-600 text-sm">{error}</div>}
-
+        {/* Helper note */}
         <p className="text-xs text-gray-500">
           Tip: For AI Mode, set <code>OPENAI_API_KEY</code> in Vercel → Project → Settings → Environment Variables.
         </p>
+
+        {error && <div className="text-red-600 text-sm">{error}</div>}
       </div>
 
       {/* Results */}
@@ -184,18 +210,33 @@ export default function Home() {
           {results.map((r, i) => (
             <div key={i} className="border p-4 rounded bg-white shadow-sm">
               <div className="flex items-center justify-between gap-3">
-                <h3 className="font-semibold text-lg truncate">{r.fileName || `File ${i + 1}`}</h3>
+                <h3 className="font-semibold text-lg truncate">
+                  {r.fileName || `File ${i + 1}`}
+                </h3>
                 {r.downloadUrl && (
-                  <a href={r.downloadUrl} download className="text-blue-600 underline">
+                  <a
+                    href={r.downloadUrl}
+                    download
+                    className="text-blue-600 underline"
+                    title="Download processed PDF"
+                  >
                     Download PDF
                   </a>
                 )}
               </div>
-              <p className="text-xs text-gray-500 mt-1 break-all">Source: {r.sourceUrl || "—"}</p>
+
+              <p className="text-xs text-gray-500 mt-1 break-all">
+                Source: {r.sourceUrl || "—"}
+              </p>
+
               {r.error && <p className="text-red-600 mt-2">Error: {r.error}</p>}
+
               {r.preview && (
                 <div className="mt-3">
-                  <h4 className="font-medium mb-1">Preview (first 500 chars after replace)</h4>
+                  <h4 className="font-medium mb-1">
+                    Preview
+                    {keepLayout ? " (layout kept, sample message)" : " (first 500 chars)"}
+                  </h4>
                   <pre className="bg-gray-50 p-2 text-sm overflow-x-auto rounded border whitespace-pre-wrap">
                     {r.preview}
                   </pre>
