@@ -6,112 +6,134 @@ import fontkit from "@pdf-lib/fontkit";
 
 export const config = { api: { bodyParser: true, sizeLimit: "25mb" } };
 
-// Unicode TTF fetched at runtime (no local font files needed)
 const FONT_URL =
   "https://raw.githubusercontent.com/GreatWizard/notosans-fontface/master/fonts/NotoSans-Regular.ttf";
 
-// Max text sent to the LLM to avoid token/size issues
+const VANITY_MAP = {
+  A:"2",B:"2",C:"2", D:"3",E:"3",F:"3", G:"4",H:"4",I:"4",
+  J:"5",K:"5",L:"5", M:"6",N:"6",O:"6", P:"7",Q:"7",R:"7",S:"7",
+  T:"8",U:"8",V:"8", W:"9",X:"9",Y:"9",Z:"9"
+};
 const MAX_INPUT_CHARS = 12000;
 
-export default async function handler(req, res) {
-  try {
-    // ---- Validate env & inputs
+function normalizeWeird(text){
+  return text
+    .replace(/[\u200B-\u200D\uFEFF\u00AD]/g,"")
+    .replace(/[⇄⇋•·–—_]+/g,"-")
+    .replace(/([A-Za-z])(\d)/g,"$1 $2")
+    .replace(/(\d)([A-Za-z])/g,"$1 $2")
+    .replace(/\s{2,}/g," ")
+    .trim();
+}
+function convertVanityToDigits(s){
+  return s.replace(
+    /\b(1[\s-]?8(?:00|33|44|55|66|77|88)[\s-]?)([A-Za-z][A-Za-z-]{3,})\b/gi,
+    (_,prefix,word)=>prefix + word.replace(/[^A-Za-z]/g,"").toUpperCase().split("").map(ch=>VANITY_MAP[ch]||"").join("")
+  );
+}
+function collapseSpelledDigits(s){
+  const map = { zero:"0", one:"1", two:"2", three:"3", four:"4", five:"5", six:"6", seven:"7", eight:"8", nine:"9" };
+  return s.replace(
+    /(?:(?:\bzero|one|two|three|four|five|six|seven|eight|nine\b)\s*(?:-|–|—)?\s*){7,}/gi,
+    m => m.replace(/\b(zero|one|two|three|four|five|six|seven|eight|nine)\b/gi, (_,w)=>map[w.toLowerCase()]).replace(/[^\d]+/g,"")
+  );
+}
+function buildPhoneRegex(){ return /(\+?\d[\d\s\-().]{7,}\d)/g; }
+
+async function embedUnicodeFont(pdfDoc){
+  pdfDoc.registerFontkit(fontkit);
+  const r = await fetch(FONT_URL, { cache: "no-store" });
+  if (!r.ok) throw new Error(`Font download failed (${r.status})`);
+  const bytes = new Uint8Array(await r.arrayBuffer());
+  return pdfDoc.embedFont(bytes, { subset: true });
+}
+
+function paginateTextToPages(pdfDoc, font, text, pageW, pageH, margin = 36, size = 10, lineH = 12){
+  const maxWidth = pageW - margin * 2;
+  const maxLines = Math.floor((pageH - margin * 2) / lineH);
+  const words = text.split(/\s+/);
+  const widthOf = (t) => font.widthOfTextAtSize(t, size);
+  const lines = [];
+  let cur = "";
+  for (const w of words) {
+    const t = cur ? cur + " " + w : w;
+    if (widthOf(t) <= maxWidth) cur = t;
+    else { if (cur) lines.push(cur); cur = w; }
+  }
+  if (cur) lines.push(cur);
+  const pages = [];
+  for (let i = 0; i < lines.length; i += maxLines) {
+    pages.push(lines.slice(i, i + maxLines).join("\n"));
+  }
+  return pages;
+}
+
+export default async function handler(req, res){
+  try{
     const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) {
-      return res.status(400).json({ error: "OPENAI_API_KEY missing" });
-    }
+    if (!apiKey) return res.status(400).json({ error: "OPENAI_API_KEY missing" });
 
     const { pdfUrl, newNumber } = req.body || {};
-    if (!pdfUrl || !newNumber) {
-      return res
-        .status(400)
-        .json({ error: "Missing pdfUrl or newNumber in request body" });
-    }
+    if (!pdfUrl || !newNumber) return res.status(400).json({ error: "Missing pdfUrl or newNumber" });
 
-    // ---- Fetch source PDF
     const pdfResp = await fetch(pdfUrl);
-    if (!pdfResp.ok) {
-      throw new Error(`Failed to fetch PDF (${pdfResp.status})`);
-    }
-    const pdfArrayBuf = await pdfResp.arrayBuffer();
-    const pdfData = Buffer.from(pdfArrayBuf);
+    if (!pdfResp.ok) throw new Error(`Failed to fetch PDF (${pdfResp.status})`);
+    const pdfBuf = Buffer.from(await pdfResp.arrayBuffer());
+    const extracted = await pdfParse(pdfBuf);
+    const original = (extracted?.text || "").trim();
 
-    // ---- Extract text
-    const extracted = await pdfParse(pdfData);
-    const originalText = (extracted?.text || "").trim();
+    // Normalize before sending to LLM (improves recall)
+    let norm = normalizeWeird(original);
+    norm = convertVanityToDigits(norm);
+    norm = collapseSpelledDigits(norm);
 
-    // ---- Build LLM prompt (truncate safely)
     const prompt =
-      `Find and replace all phone numbers (any format, incl. symbols and spelled-out digits) in the following text with ${newNumber}.\n` +
+      `Find and replace all phone numbers (any format, incl. symbols and spelled-out digits) in the following text with ${newNumber}. ` +
       `Return ONLY the modified text, no extra commentary.\n\n` +
-      originalText.slice(0, MAX_INPUT_CHARS);
+      norm.slice(0, MAX_INPUT_CHARS);
 
-    // ---- OpenAI call (smart model options)
     const client = new OpenAI({ apiKey });
     const model = process.env.OPENAI_MODEL || "gpt-5";
+    const payload = { model, messages: [{ role: "user", content: prompt }] };
+    if (!/^gpt-5/i.test(model)) payload.temperature = 0;
 
-    // Only include temperature for models that support it.
-    // gpt-5 requires default temperature (1) and rejects overrides.
-    const payload = {
-      model,
-      messages: [{ role: "user", content: prompt }],
-    };
-    if (!/^gpt-5/i.test(model)) {
-      // Safer, more deterministic output for older models
-      payload.temperature = 0;
+    const resp = await client.chat.completions.create(payload);
+    let replaced = resp?.choices?.[0]?.message?.content?.trim() || "";
+
+    // Fallback local replace if model returns nothing
+    if (!replaced) {
+      const phoneRegex = buildPhoneRegex();
+      replaced = norm.replace(phoneRegex, newNumber);
     }
 
-    const completion = await client.chat.completions.create(payload);
+    const srcDoc = await PDFDocument.load(pdfBuf);
+    const outDoc = await PDFDocument.create();
+    const font = await embedUnicodeFont(outDoc);
 
-    let newText =
-      completion?.choices?.[0]?.message?.content?.trim() || "";
+    const firstSrcPage = srcDoc.getPages()[0];
+    const pageW = firstSrcPage?.getWidth?.() || 612;
+    const pageH = firstSrcPage?.getHeight?.() || 792;
 
-    // Fallback: if model returned empty, do a conservative local replace
-    if (!newText) {
-      const phoneRegex = /(\+?\d[\d\s•\-().⇄⇋–_]{7,}\d)/g;
-      const normalize = (txt) =>
-        txt.replace(/[⇄⇋•–_]+/g, "-").replace(/\s{2,}/g, " ");
-      newText = normalize(originalText).replace(phoneRegex, newNumber);
+    const pages = paginateTextToPages(outDoc, font, replaced, pageW, pageH);
+    if (pages.length === 0) pages.push("(empty)");
+
+    for (const block of pages) {
+      const p = outDoc.addPage([pageW, pageH]);
+      p.drawText(block, {
+        x: 36, y: pageH - 72,
+        size: 10, lineHeight: 12, font,
+        maxWidth: pageW - 72
+      });
     }
 
-    // ---- Rebuild output PDF with Unicode font (fixes ℗/™/® issues)
-    const pdfDoc = await PDFDocument.load(pdfData);
-    pdfDoc.registerFontkit(fontkit);
-
-    const fontRes = await fetch(FONT_URL, { cache: "no-store" });
-    if (!fontRes.ok) {
-      throw new Error(`Font download failed (${fontRes.status})`);
-    }
-    const fontBytes = new Uint8Array(await fontRes.arrayBuffer());
-    const unicodeFont = await pdfDoc.embedFont(fontBytes, { subset: true });
-
-    const page = pdfDoc.getPages()[0];
-
-    // Keep preview block modest to avoid text overflow on the page.
-    const previewChunk = newText.slice(0, 1800);
-
-    page.drawText(previewChunk, {
-      x: 36,
-      y: page.getHeight() - 72,
-      size: 10,
-      lineHeight: 12,
-      font: unicodeFont,
-      maxWidth: page.getWidth() - 72,
-    });
-
-    const outPdf = await pdfDoc.save();
-    const base64 = Buffer.from(outPdf).toString("base64");
-
+    const out = await outDoc.save();
     return res.status(200).json({
-      fileName: pdfUrl.split("/").pop(),
-      preview: newText.substring(0, 500),
-      downloadUrl: `data:application/pdf;base64,${base64}`,
+      fileName: (pdfUrl.split("/").pop() || "output.pdf").replace(/[^a-zA-Z0-9._-]/g, "_"),
+      preview: replaced.substring(0, 500),
+      downloadUrl: `data:application/pdf;base64,${Buffer.from(out).toString("base64")}`
     });
   } catch (err) {
-    // Helpful error for logs + user
     console.error("aiProcess error:", err);
-    const msg =
-      typeof err?.message === "string" ? err.message : String(err);
-    return res.status(500).json({ error: msg });
+    return res.status(500).json({ error: err?.message || String(err) });
   }
 }
