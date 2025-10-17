@@ -28,6 +28,29 @@ async function embedUnicodeFont(pdfDoc) {
   return pdfDoc.embedFont(bytes, { subset: true });
 }
 
+/** Load pdfjs-dist in a way that works across versions/builds.
+ *  - Try ESM root first (v4+)
+ *  - Fallback to legacy mjs build
+ */
+async function loadPdfJs() {
+  try {
+    const mod = await import("pdfjs-dist");
+    if (mod?.getDocument) return { getDocument: mod.getDocument };
+    if (mod?.default?.getDocument) return { getDocument: mod.default.getDocument };
+  } catch (_) {}
+  try {
+    const mod = await import("pdfjs-dist/legacy/build/pdf.mjs");
+    if (mod?.getDocument) return { getDocument: mod.getDocument };
+    if (mod?.default?.getDocument) return { getDocument: mod.default.getDocument };
+  } catch (e) {
+    // Final throw with helpful message
+    throw new Error(
+      `Unable to load pdfjs-dist. Make sure "pdfjs-dist" is in dependencies. Original error: ${e?.message || e}`
+    );
+  }
+  throw new Error("pdfjs-dist loaded but getDocument was not found.");
+}
+
 // ------- IN-PLACE (keep layout) -------
 async function inplaceReplace(pdfBytes, newNumber) {
   // Copy original pages first
@@ -37,11 +60,11 @@ async function inplaceReplace(pdfBytes, newNumber) {
   copied.forEach((p) => outDoc.addPage(p));
   const font = await embedUnicodeFont(outDoc);
 
-  // ⬇️ Dynamic ESM import (fixes your build error)
-  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  // ✅ Dynamic import (no static 'pdf.js' anywhere)
+  const { getDocument } = await loadPdfJs();
 
   // Parse with pdf.js (no worker in serverless)
-  const loadingTask = pdfjs.getDocument({ data: pdfBytes, disableWorker: true });
+  const loadingTask = getDocument({ data: pdfBytes, disableWorker: true });
   const jsDoc = await loadingTask.promise;
   const pageCount = jsDoc.numPages;
 
@@ -171,16 +194,13 @@ async function overlayPreview(pdfBytes, newNumber) {
   return await pdfDoc.save();
 }
 
-// ------- Rebuild (plain text PDF, everything replaced) -------
+// ------- Rebuild (plain text PDF) -------
 async function rebuildPdf(pdfBytes, newNumber) {
   const out = await PDFDocument.create();
   const font = await embedUnicodeFont(out);
-
   const text = (await pdfParse(pdfBytes)).text || "";
   const replaced = normalizeWeird(text).replace(PHONE_RE, newNumber);
-
-  // Default page size (Letter) if unknown
-  const page = out.addPage([612, 792]);
+  const page = out.addPage([612, 792]); // Letter
   page.drawText(replaced.slice(0, 8000), {
     x: 36, y: 792 - 72, size: 10, lineHeight: 12, font, maxWidth: 612 - 72
   });
