@@ -1,12 +1,9 @@
 // pages/index.js
-// Smart PDF Replacer UI
-// - Paste multiple PDF URLs (one per line)
-// - Enter a replacement number
-// - Choose: Local vs AI Mode (GPT)
-// - Choose: Keep Layout (in-place, client-side) vs Rebuild (server-side)
-// - Progress bar while processing
-// - Per-file download + simple PDF preview
-// - Download All (ZIP)
+// Smart PDF Replacer (client in-place mode + server rebuild)
+// - Keep Layout (in-place) runs fully in the browser (no server pdfjs).
+// - Rebuild runs on /api/process (no pdfjs on server).
+// - AI toggle available (uses /api/aiProcess if you enable it).
+// - Progress bar, per-file preview, ZIP download.
 
 import { useState } from "react";
 import { motion } from "framer-motion";
@@ -31,7 +28,7 @@ export default function Home() {
   const [replaceNumber, setReplaceNumber] = useState("");
 
   // Toggles
-  const [aiMode, setAiMode] = useState(false);       // Local by default; no key required
+  const [aiMode, setAiMode] = useState(false);        // Local by default; no key required
   const [keepLayout, setKeepLayout] = useState(true); // Keep original layout by default (in-place on client)
 
   // State
@@ -59,11 +56,14 @@ export default function Home() {
     return bytes;
   };
 
-  const arrayBufferToDataUrl = (mime, ab) => {
-    const bytes = new Uint8Array(ab);
-    let bin = "";
-    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-    const base64 = btoa(bin);
+  // Robust bytes → base64 (avoid call stack limits on big PDFs)
+  const bytesToDataUrl = (mime, bytes) => {
+    const chunk = 0x8000;
+    let binary = "";
+    for (let i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    }
+    const base64 = btoa(binary);
     return `data:${mime};base64,${base64}`;
   };
 
@@ -75,7 +75,13 @@ export default function Home() {
     const pdfjsMod = await import("pdfjs-dist");
 
     // Normalize module shapes
-    const PDFDocument = pdfLibMod.PDFDocument ?? pdfLibMod.default?.PDFDocument;
+    const PDFDocument =
+      pdfLibMod.PDFDocument ?? pdfLibMod.default?.PDFDocument;
+    const rgb =
+      pdfLibMod.rgb ?? pdfLibMod.default?.rgb;
+    if (!PDFDocument || !rgb) {
+      throw new Error("pdf-lib failed to load");
+    }
     const fontkit = fontkitMod.default || fontkitMod;
 
     const pdfjs = pdfjsMod.default?.getDocument ? pdfjsMod.default : pdfjsMod;
@@ -162,7 +168,7 @@ export default function Home() {
         const raw = L.text || "";
         if (!raw) continue;
 
-        // Run detection on raw (works after we normalize weird breaks earlier during extraction)
+        // Run detection on raw
         let m;
         while ((m = PHONE_RE.exec(raw)) !== null) {
           const mStart = m.index;
@@ -171,7 +177,7 @@ export default function Home() {
           // Map match back to contributing items
           const usedItems = [];
           for (const s of L.spans) {
-            if (s.itemIndex < 0) continue; // space we inserted
+            if (s.itemIndex < 0) continue; // inserted space
             if (s.start < mEnd && s.end > mStart) usedItems.push(L.items[s.itemIndex]);
           }
           if (!usedItems.length) continue;
@@ -189,13 +195,13 @@ export default function Home() {
           const pdfHeight = (topY - bottomY) * scaleY;
           const pdfY = pdfTopFromBottom - pdfHeight;
 
-          // Cover + draw replacement
+          // Cover (white fill) + draw replacement
           page.drawRectangle({
             x: pdfX,
             y: pdfY,
             width: pdfWidth,
             height: pdfHeight,
-            color: { type: "RGB", r: 1, g: 1, b: 1 },
+            color: rgb(1, 1, 1),   // ✅ use pdf-lib rgb color (prevents 'toString' errors)
           });
           page.drawText(newNumber, {
             x: pdfX + 0.5,
@@ -208,8 +214,8 @@ export default function Home() {
       }
     }
 
-    const out = await pdfDoc.save();
-    return arrayBufferToDataUrl("application/pdf", out);
+    const outBytes = await pdfDoc.save(); // Uint8Array
+    return bytesToDataUrl("application/pdf", outBytes);
   };
 
   // ---- Main handler ----
@@ -245,7 +251,7 @@ export default function Home() {
             downloadUrl,
           };
         } else {
-          // Rebuild/Overlay handled on the server (no pdfjs-dist on server)
+          // Rebuild (or overlay if you switch) handled on the server
           const endpoint = aiMode ? "/api/aiProcess" : "/api/process";
           const res = await fetch(endpoint, {
             method: "POST",
@@ -253,7 +259,7 @@ export default function Home() {
             body: JSON.stringify({
               pdfUrl: url,
               newNumber: replaceNumber,
-              mode: "rebuild", // or "overlay" if you want to switch
+              mode: "rebuild", // change to "overlay" if you want that path
             }),
           });
           data = await res.json();
