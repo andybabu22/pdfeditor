@@ -1,11 +1,12 @@
 // pages/index.js
-// Beginner-friendly UI for Smart PDF Replacer
+// Smart PDF Replacer UI
 // - Paste multiple PDF URLs (one per line)
 // - Enter a replacement number
-// - Choose: Local vs AI mode
-// - Choose: Keep Layout (in-place) vs Rebuild (plain text)
-// - See a progress bar while processing
-// - Download each PDF or Download All (ZIP)
+// - Choose: Local vs AI Mode (GPT)
+// - Choose: Keep Layout (in-place) vs Rebuild
+// - Progress bar while processing
+// - Per-file download + simple PDF preview
+// - Download All (ZIP)
 
 import { useState } from "react";
 import { motion } from "framer-motion";
@@ -17,12 +18,12 @@ export default function Home() {
   const [replaceNumber, setReplaceNumber] = useState("");
 
   // Toggles
-  const [aiMode, setAiMode] = useState(false);   // Local (default) doesn't need an API key
-  const [keepLayout, setKeepLayout] = useState(true); // Keep original layout by default
+  const [aiMode, setAiMode] = useState(false);        // Local by default; no key required
+  const [keepLayout, setKeepLayout] = useState(true); // Keep original layout by default (in-place)
 
-  // State / Output
+  // State
   const [loading, setLoading] = useState(false);
-  const [results, setResults] = useState([]);
+  const [results, setResults] = useState([]); // [{fileName, sourceUrl, downloadUrl, preview, error}]
   const [error, setError] = useState("");
 
   // Progress bar
@@ -30,10 +31,15 @@ export default function Home() {
   const [progressDone, setProgressDone] = useState(0);
   const percent = progressTotal ? Math.round((progressDone / progressTotal) * 100) : 0;
 
-  // Convert data URL -> bytes (for zipping)
+  // Track preview visibility per result (index -> boolean)
+  const [openPreview, setOpenPreview] = useState({});
+
+  const togglePreview = (idx) =>
+    setOpenPreview((prev) => ({ ...prev, [idx]: !prev[idx] }));
+
+  // Convert data URL -> bytes for zipping
   const dataURLtoUint8Array = (dataURL) => {
     const base64 = dataURL.split(",")[1];
-    // In the browser we have atob:
     const binary = atob(base64);
     const len = binary.length;
     const bytes = new Uint8Array(len);
@@ -45,11 +51,18 @@ export default function Home() {
     setError("");
     setResults([]);
     setProgressDone(0);
+    setOpenPreview({});
 
-    // Clean & split URLs
-    const urls = pdfUrls.split(/\n|,/).map(u => u.trim()).filter(Boolean);
-    if (!urls.length) { setError("Please enter at least one PDF URL."); return; }
-    if (!replaceNumber.trim()) { setError("Please enter the replacement phone number."); return; }
+    // Split URLs (newline or comma)
+    const urls = pdfUrls.split(/\n|,/).map((u) => u.trim()).filter(Boolean);
+    if (!urls.length) {
+      setError("Please enter at least one PDF URL.");
+      return;
+    }
+    if (!replaceNumber.trim()) {
+      setError("Please enter the replacement phone number.");
+      return;
+    }
 
     setProgressTotal(urls.length);
     setLoading(true);
@@ -62,8 +75,7 @@ export default function Home() {
         const body = {
           pdfUrl: url,
           newNumber: replaceNumber,
-          // "inplace" keeps headings/formatting; "rebuild" makes a clean text PDF
-          mode: keepLayout ? "inplace" : "rebuild",
+          mode: keepLayout ? "inplace" : "rebuild", // "inplace" keeps headings/format
         };
 
         const res = await fetch(endpoint, {
@@ -82,8 +94,7 @@ export default function Home() {
         });
       }
 
-      // update progress after each file
-      setProgressDone(prev => prev + 1);
+      setProgressDone((prev) => prev + 1);
     }
 
     setResults(processed);
@@ -118,7 +129,7 @@ export default function Home() {
         📄 Smart PDF Replacer
       </motion.h1>
 
-      {/* Progress bar (top) */}
+      {/* Progress bar */}
       {loading && (
         <div className="max-w-3xl mx-auto mb-6">
           <div className="w-full bg-gray-200 h-3 rounded">
@@ -141,8 +152,8 @@ export default function Home() {
         <textarea
           value={pdfUrls}
           onChange={(e) => setPdfUrls(e.target.value)}
-          placeholder="https://example.com/file1.pdf
-https://example.com/file2.pdf"
+          placeholder={`https://example.com/file1.pdf
+https://example.com/file2.pdf`}
           className="w-full p-3 border rounded"
           rows={6}
         />
@@ -157,18 +168,18 @@ https://example.com/file2.pdf"
           className="w-full p-3 border rounded"
         />
 
-        {/* Toggles */}
+        {/* Toggles + Start */}
         <div className="flex flex-wrap items-center gap-3 pt-2">
-          {/* AI Mode */}
           <button
             onClick={() => setAiMode(!aiMode)}
-            className={`px-4 py-2 rounded text-white ${aiMode ? "bg-purple-600" : "bg-gray-700"}`}
+            className={`px-4 py-2 rounded text-white ${
+              aiMode ? "bg-purple-600" : "bg-gray-700"
+            }`}
             title="AI Mode uses your OpenAI key in Vercel → Settings → Environment Variables."
           >
             {aiMode ? "AI Mode (GPT) ON" : "Local Detection"}
           </button>
 
-          {/* Layout Mode */}
           <button
             onClick={() => setKeepLayout(!keepLayout)}
             className="px-4 py-2 rounded text-white bg-slate-700"
@@ -177,7 +188,6 @@ https://example.com/file2.pdf"
             {keepLayout ? "Layout: Keep (In-place)" : "Layout: Rebuild (Plain Text)"}
           </button>
 
-          {/* Start */}
           <button
             disabled={loading}
             onClick={handleProcess}
@@ -187,12 +197,11 @@ https://example.com/file2.pdf"
           </button>
         </div>
 
-        {/* Helper note */}
+        {error && <div className="text-red-600 text-sm">{error}</div>}
+
         <p className="text-xs text-gray-500">
           Tip: For AI Mode, set <code>OPENAI_API_KEY</code> in Vercel → Project → Settings → Environment Variables.
         </p>
-
-        {error && <div className="text-red-600 text-sm">{error}</div>}
       </div>
 
       {/* Results */}
@@ -213,16 +222,29 @@ https://example.com/file2.pdf"
                 <h3 className="font-semibold text-lg truncate">
                   {r.fileName || `File ${i + 1}`}
                 </h3>
-                {r.downloadUrl && (
-                  <a
-                    href={r.downloadUrl}
-                    download
-                    className="text-blue-600 underline"
-                    title="Download processed PDF"
-                  >
-                    Download PDF
-                  </a>
-                )}
+
+                <div className="flex items-center gap-3">
+                  {r.downloadUrl && (
+                    <>
+                      <button
+                        onClick={() => togglePreview(i)}
+                        className="px-3 py-1 rounded bg-gray-200 hover:bg-gray-300 text-sm"
+                        title="Toggle PDF preview"
+                      >
+                        {openPreview[i] ? "Hide Preview" : "Preview"}
+                      </button>
+
+                      <a
+                        href={r.downloadUrl}
+                        download
+                        className="text-blue-600 underline"
+                        title="Download processed PDF"
+                      >
+                        Download PDF
+                      </a>
+                    </>
+                  )}
+                </div>
               </div>
 
               <p className="text-xs text-gray-500 mt-1 break-all">
@@ -234,12 +256,24 @@ https://example.com/file2.pdf"
               {r.preview && (
                 <div className="mt-3">
                   <h4 className="font-medium mb-1">
-                    Preview
-                    {keepLayout ? " (layout kept, sample message)" : " (first 500 chars)"}
+                    {keepLayout
+                      ? "Preview (layout kept — sample message)"
+                      : "Preview (first 500 chars)"}
                   </h4>
                   <pre className="bg-gray-50 p-2 text-sm overflow-x-auto rounded border whitespace-pre-wrap">
                     {r.preview}
                   </pre>
+                </div>
+              )}
+
+              {/* Simple inline PDF preview */}
+              {openPreview[i] && r.downloadUrl && (
+                <div className="mt-3">
+                  <iframe
+                    src={r.downloadUrl}
+                    title={`preview-${i}`}
+                    className="w-full h-[480px] border rounded"
+                  />
                 </div>
               )}
             </div>
