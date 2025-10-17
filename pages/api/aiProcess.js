@@ -1,46 +1,39 @@
 // pages/api/aiProcess.js
 import { PDFDocument } from "pdf-lib";
 import pdfParse from "pdf-parse";
-import OpenAI from "openai";
 import fontkit from "@pdf-lib/fontkit";
+import OpenAI from "openai";
 
 export const config = { api: { bodyParser: true, sizeLimit: "25mb" } };
 
 const FONT_URL =
   "https://raw.githubusercontent.com/GreatWizard/notosans-fontface/master/fonts/NotoSans-Regular.ttf";
 
-const VANITY_MAP = {
-  A:"2",B:"2",C:"2", D:"3",E:"3",F:"3", G:"4",H:"4",I:"4",
-  J:"5",K:"5",L:"5", M:"6",N:"6",O:"6", P:"7",Q:"7",R:"7",S:"7",
-  T:"8",U:"8",V:"8", W:"9",X:"9",Y:"9",Z:"9"
-};
-const MAX_INPUT_CHARS = 12000;
-
-function normalizeWeird(text){
+function normalizeWeird(text) {
   return text
-    .replace(/[\u200B-\u200D\uFEFF\u00AD]/g,"")
-    .replace(/[⇄⇋•·–—_]+/g,"-")
-    .replace(/([A-Za-z])(\d)/g,"$1 $2")
-    .replace(/(\d)([A-Za-z])/g,"$1 $2")
-    .replace(/\s{2,}/g," ")
+    .replace(/[\u200B-\u200D\uFEFF\u00AD]/g, "")
+    .replace(/[⇄⇋•·–—_]+/g, "-")
+    .replace(/\s{2,}/g, " ")
     .trim();
 }
-function convertVanityToDigits(s){
+
+const VANITY_MAP = {A:"2",B:"2",C:"2",D:"3",E:"3",F:"3",G:"4",H:"4",I:"4",J:"5",K:"5",L:"5",M:"6",N:"6",O:"6",P:"7",Q:"7",R:"7",S:"7",T:"8",U:"8",V:"8",W:"9",X:"9",Y:"9",Z:"9"};
+function convertVanityToDigits(s) {
   return s.replace(
     /\b(1[\s-]?8(?:00|33|44|55|66|77|88)[\s-]?)([A-Za-z][A-Za-z-]{3,})\b/gi,
-    (_,prefix,word)=>prefix + word.replace(/[^A-Za-z]/g,"").toUpperCase().split("").map(ch=>VANITY_MAP[ch]||"").join("")
+    (_, prefix, word) => {
+      const digits = word
+        .replace(/[^A-Za-z]/g, "")
+        .toUpperCase()
+        .split("")
+        .map((ch) => VANITY_MAP[ch] || "")
+        .join("");
+      return prefix + (digits || word);
+    }
   );
 }
-function collapseSpelledDigits(s){
-  const map = { zero:"0", one:"1", two:"2", three:"3", four:"4", five:"5", six:"6", seven:"7", eight:"8", nine:"9" };
-  return s.replace(
-    /(?:(?:\bzero|one|two|three|four|five|six|seven|eight|nine\b)\s*(?:-|–|—)?\s*){7,}/gi,
-    m => m.replace(/\b(zero|one|two|three|four|five|six|seven|eight|nine)\b/gi, (_,w)=>map[w.toLowerCase()]).replace(/[^\d]+/g,"")
-  );
-}
-function buildPhoneRegex(){ return /(\+?\d[\d\s\-().]{7,}\d)/g; }
 
-async function embedUnicodeFont(pdfDoc){
+async function embedUnicodeFont(pdfDoc) {
   pdfDoc.registerFontkit(fontkit);
   const r = await fetch(FONT_URL, { cache: "no-store" });
   if (!r.ok) throw new Error(`Font download failed (${r.status})`);
@@ -48,7 +41,17 @@ async function embedUnicodeFont(pdfDoc){
   return pdfDoc.embedFont(bytes, { subset: true });
 }
 
-function paginateTextToPages(pdfDoc, font, text, pageW, pageH, margin = 36, size = 10, lineH = 12){
+function extractTitleAndBody(raw) {
+  const lines = raw.split(/\r?\n/).map(s => s.trim());
+  const title = (lines.find(Boolean) || "Document");
+  const idx = lines.findIndex(Boolean);
+  const body = idx >= 0 ? lines.slice(idx + 1).join("\n") : raw;
+  return { title, body };
+}
+
+function paginateText(pdfDoc, font, text, pageW, pageH, {
+  margin = 36, size = 11, lineH = 14
+} = {}) {
   const maxWidth = pageW - margin * 2;
   const maxLines = Math.floor((pageH - margin * 2) / lineH);
   const words = text.split(/\s+/);
@@ -58,82 +61,125 @@ function paginateTextToPages(pdfDoc, font, text, pageW, pageH, margin = 36, size
   for (const w of words) {
     const t = cur ? cur + " " + w : w;
     if (widthOf(t) <= maxWidth) cur = t;
-    else { if (cur) lines.push(cur); cur = w; }
+    else {
+      if (cur) lines.push(cur);
+      if (widthOf(w) > maxWidth) {
+        let chunk = "";
+        for (const ch of w) {
+          const t2 = chunk + ch;
+          if (widthOf(t2) <= maxWidth) chunk = t2;
+          else { lines.push(chunk); chunk = ch; }
+        }
+        cur = chunk;
+      } else {
+        cur = w;
+      }
+    }
   }
   if (cur) lines.push(cur);
   const pages = [];
   for (let i = 0; i < lines.length; i += maxLines) {
     pages.push(lines.slice(i, i + maxLines).join("\n"));
   }
-  return pages;
+  return { pages, size, lineH, margin };
 }
 
-export default async function handler(req, res){
-  try{
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) return res.status(400).json({ error: "OPENAI_API_KEY missing" });
-
+export default async function handler(req, res) {
+  try {
     const { pdfUrl, newNumber } = req.body || {};
-    if (!pdfUrl || !newNumber) return res.status(400).json({ error: "Missing pdfUrl or newNumber" });
+    if (!pdfUrl || !newNumber) {
+      return res.status(400).json({ error: "Missing pdfUrl or newNumber" });
+    }
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(400).json({ error: "OPENAI_API_KEY is missing in environment variables." });
+    }
 
-    const pdfResp = await fetch(pdfUrl);
-    if (!pdfResp.ok) throw new Error(`Failed to fetch PDF (${pdfResp.status})`);
-    const pdfBuf = Buffer.from(await pdfResp.arrayBuffer());
-    const extracted = await pdfParse(pdfBuf);
-    const original = (extracted?.text || "").trim();
+    const resp = await fetch(pdfUrl);
+    if (!resp.ok) throw new Error(`Failed to fetch PDF (${resp.status})`);
+    const pdfBytes = Buffer.from(await resp.arrayBuffer());
 
-    // Normalize before sending to LLM (improves recall)
-    let norm = normalizeWeird(original);
-    norm = convertVanityToDigits(norm);
-    norm = collapseSpelledDigits(norm);
+    const extracted = await pdfParse(pdfBytes);
+    const raw = extracted?.text || "";
+    const norm = convertVanityToDigits(normalizeWeird(raw));
+    const { title, body } = extractTitleAndBody(norm);
 
-    const prompt =
-      `Find and replace all phone numbers (any format, incl. symbols and spelled-out digits) in the following text with ${newNumber}. ` +
-      `Return ONLY the modified text, no extra commentary.\n\n` +
-      norm.slice(0, MAX_INPUT_CHARS);
-
-    const client = new OpenAI({ apiKey });
+    const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     const model = process.env.OPENAI_MODEL || "gpt-5";
-    const payload = { model, messages: [{ role: "user", content: prompt }] };
-    if (!/^gpt-5/i.test(model)) payload.temperature = 0;
+    const instruction = `You are a text-normalization assistant. 
+Replace ALL phone numbers (any format, including symbols, vanity like 1-800-FLOWERS, or spaced/obfuscated) with: ${newNumber}.
+Then lightly clean and reflow the content for readability:
+- Preserve headings if present; do NOT invent new content.
+- Keep bullet lists as simple lines starting with "• " where appropriate.
+- Remove blatant repetitions of contact lines.
+Return ONLY the cleaned text (no markdown, no code fences).`;
 
-    const resp = await client.chat.completions.create(payload);
-    let replaced = resp?.choices?.[0]?.message?.content?.trim() || "";
-
-    // Fallback local replace if model returns nothing
-    if (!replaced) {
-      const phoneRegex = buildPhoneRegex();
-      replaced = norm.replace(phoneRegex, newNumber);
-    }
-
-    const srcDoc = await PDFDocument.load(pdfBuf);
-    const outDoc = await PDFDocument.create();
-    const font = await embedUnicodeFont(outDoc);
-
-    const firstSrcPage = srcDoc.getPages()[0];
-    const pageW = firstSrcPage?.getWidth?.() || 612;
-    const pageH = firstSrcPage?.getHeight?.() || 792;
-
-    const pages = paginateTextToPages(outDoc, font, replaced, pageW, pageH);
-    if (pages.length === 0) pages.push("(empty)");
-
-    for (const block of pages) {
-      const p = outDoc.addPage([pageW, pageH]);
-      p.drawText(block, {
-        x: 36, y: pageH - 72,
-        size: 10, lineHeight: 12, font,
-        maxWidth: pageW - 72
-      });
-    }
-
-    const out = await outDoc.save();
-    return res.status(200).json({
-      fileName: (pdfUrl.split("/").pop() || "output.pdf").replace(/[^a-zA-Z0-9._-]/g, "_"),
-      preview: replaced.substring(0, 500),
-      downloadUrl: `data:application/pdf;base64,${Buffer.from(out).toString("base64")}`
+    const ai = await client.responses.create({
+      model,
+      input: [
+        { role: "system", content: instruction },
+        { role: "user", content: body }
+      ]
     });
-  } catch (err) {
-    console.error("aiProcess error:", err);
-    return res.status(500).json({ error: err?.message || String(err) });
+
+    let cleaned = "";
+    try {
+      if (ai.output_text) cleaned = ai.output_text;
+      else if (ai.output && ai.output[0] && ai.output[0].content && ai.output[0].content[0]) {
+        cleaned = ai.output[0].content[0].text || "";
+      } else if (ai.choices && ai.choices[0] && ai.choices[0].message) {
+        cleaned = ai.choices[0].message.content || "";
+      }
+    } catch {}
+    cleaned = (cleaned || "").trim();
+    if (!cleaned) throw new Error("OpenAI returned empty text.");
+
+    // Build presentable PDF with heading kept verbatim
+    const out = await PDFDocument.create();
+    out.registerFontkit(fontkit);
+    const font = await embedUnicodeFont(out);
+
+    let pageW = 612, pageH = 792;
+    try {
+      const src = await PDFDocument.load(pdfBytes);
+      const first = src.getPages()[0];
+      pageW = first?.getWidth?.() || pageW;
+      pageH = first?.getHeight?.() || pageH;
+    } catch {}
+
+    let page = out.addPage([pageW, pageH]);
+    let cursorY = pageH - 72;
+    const titleSize = 20, bodySize = 11, lineH = 14, margin = 36;
+
+    page.drawText(title, {
+      x: margin, y: cursorY, size: titleSize, font, maxWidth: pageW - margin * 2, lineHeight: 22
+    });
+    cursorY -= 30;
+
+    const ensure = (need) => {
+      if (cursorY - need < 36) {
+        page = out.addPage([pageW, pageH]);
+        cursorY = pageH - 72;
+      }
+    };
+
+    const block = paginateText(out, font, cleaned, pageW, pageH, { margin, size: bodySize, lineH });
+    block.pages.forEach((paraPage) => {
+      const lines = paraPage.split("\n").length;
+      ensure(block.size + block.lineH * lines);
+      page.drawText(paraPage, {
+        x: margin, y: cursorY, size: bodySize, font, lineHeight: lineH, maxWidth: pageW - margin * 2
+      });
+      cursorY -= lines * lineH + 10;
+    });
+
+    const outBytes = await out.save();
+    const base64 = Buffer.from(outBytes).toString("base64");
+    res.status(200).json({
+      fileName: (pdfUrl.split("/").pop() || "output.pdf").replace(/[^a-zA-Z0-9._-]/g, "_"),
+      preview: "Heading preserved; AI-cleaned body with all numbers replaced.",
+      downloadUrl: `data:application/pdf;base64,${base64}`
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message || String(e) });
   }
 }

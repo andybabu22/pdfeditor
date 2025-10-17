@@ -1,22 +1,25 @@
-# pdfeditor by andy (Unicode-safe)
+# Smart PDF Replacer (Next.js + Vercel)
 
-Vercel-ready Next.js app that replaces phone numbers in PDFs.
-- Local mode (regex + normalization) — no API key needed
-- AI mode (GPT-5) — set OPENAI_API_KEY in `.env.local`
-- Unicode font is fetched **at runtime** (no local font files)
+Modes:
+- **Presentable (default)**: keeps original heading exactly, cleans/reflows the rest, replaces all phone numbers with your number.
+- **Keep Layout (in-place)**: client-side overlay; preserves layout and replaces numbers where they appear.
+- **Plain Rebuild**: simple text-only output.
 
-## Deploy steps
-1) Push to GitHub
-2) On Vercel:
-   - Framework Preset: Next.js
-   - Root Directory: repo root (folder containing `pages/` and `package.json`)
-   - Build Command: `npm run build`
-   - Output Directory: **leave blank**
-   - Redeploy (clear build cache if needed)
+Optional **AI Mode**: set `OPENAI_API_KEY` (and `OPENAI_MODEL` like `gpt-5` or `gpt-4o-mini`) in Vercel → Project → Settings → Environment Variables.
 
-## Dev
-```bash
-npm install
-npm run dev
-```
+## Quick Start
+1. Download this repo ZIP and upload to GitHub.
+2. Import into Vercel → will auto-detect Next.js.
+3. (Optional) Add `OPENAI_API_KEY` in Vercel if using AI Mode.
+4. Deploy.
 
+## Files
+- `pages/api/process.js` → server Presentable/Rebuild/Overlay
+- `pages/api/aiProcess.js` → server Presentable powered by OpenAI (optional)
+- `pages/api/fetch.js` → CORS-safe proxy for client in-place
+- `pages/index.js` → UI (progress bar, previews, ZIP)
+- Tailwind configured via `pages/_app.js`, `styles/globals.css`, `tailwind.config.js`, `postcss.config.js`
+
+## Notes
+- No `pdfjs-dist` import on server. Client-side in-place mode handles PDF.js worker via CDN automatically.
+- If you see build cache issues in Vercel, Redeploy with **Clear build cache**.

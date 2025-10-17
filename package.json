@@ -1,6 +1,6 @@
 {
-  "name": "pdfeditor",
-  "version": "1.2.0",
+  "name": "smart-pdf-replacer",
+  "version": "1.3.0",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -13,7 +13,7 @@
     "framer-motion": "^11.0.0",
     "jszip": "^3.10.1",
     "next": "^14.2.0",
-    "openai": "^4.0.0",
+    "openai": "^4.47.1",
     "pdf-lib": "^1.17.1",
     "pdf-parse": "^1.1.1",
     "pdfjs-dist": "^4.7.76",
