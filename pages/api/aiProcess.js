@@ -1,3 +1,4 @@
+// pages/api/aiProcess.js
 import { PDFDocument } from "pdf-lib";
 import pdfParse from "pdf-parse";
 import OpenAI from "openai";
@@ -5,42 +6,88 @@ import fontkit from "@pdf-lib/fontkit";
 
 export const config = { api: { bodyParser: true, sizeLimit: "25mb" } };
 
-const FONT_URL = "https://raw.githubusercontent.com/GreatWizard/notosans-fontface/master/fonts/NotoSans-Regular.ttf";
+// Unicode TTF fetched at runtime (no local font files needed)
+const FONT_URL =
+  "https://raw.githubusercontent.com/GreatWizard/notosans-fontface/master/fonts/NotoSans-Regular.ttf";
+
+// Max text sent to the LLM to avoid token/size issues
+const MAX_INPUT_CHARS = 12000;
 
 export default async function handler(req, res) {
   try {
-    if (!process.env.OPENAI_API_KEY) return res.status(400).json({ error: "OPENAI_API_KEY missing" });
+    // ---- Validate env & inputs
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      return res.status(400).json({ error: "OPENAI_API_KEY missing" });
+    }
 
     const { pdfUrl, newNumber } = req.body || {};
-    if (!pdfUrl || !newNumber) return res.status(400).json({ error: "Missing pdfUrl or newNumber" });
+    if (!pdfUrl || !newNumber) {
+      return res
+        .status(400)
+        .json({ error: "Missing pdfUrl or newNumber in request body" });
+    }
 
-    const response = await fetch(pdfUrl);
-    if (!response.ok) throw new Error(`Failed to fetch PDF (${response.status})`);
-    const arrayBuf = await response.arrayBuffer();
-    const pdfData = Buffer.from(arrayBuf);
+    // ---- Fetch source PDF
+    const pdfResp = await fetch(pdfUrl);
+    if (!pdfResp.ok) {
+      throw new Error(`Failed to fetch PDF (${pdfResp.status})`);
+    }
+    const pdfArrayBuf = await pdfResp.arrayBuffer();
+    const pdfData = Buffer.from(pdfArrayBuf);
 
-    const text = (await pdfParse(pdfData)).text || "";
+    // ---- Extract text
+    const extracted = await pdfParse(pdfData);
+    const originalText = (extracted?.text || "").trim();
 
-    const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-    const prompt = "Find and replace all phone numbers (any format, symbols, or spelled-out digits) in the following text with " + newNumber + ". Return only the modified text, no extra commentary.\n\n" + text.substring(0, 12000);
+    // ---- Build LLM prompt (truncate safely)
+    const prompt =
+      `Find and replace all phone numbers (any format, incl. symbols and spelled-out digits) in the following text with ${newNumber}.\n` +
+      `Return ONLY the modified text, no extra commentary.\n\n` +
+      originalText.slice(0, MAX_INPUT_CHARS);
 
-    const completion = await client.chat.completions.create({
-      model: process.env.OPENAI_MODEL || "gpt-5",
+    // ---- OpenAI call (smart model options)
+    const client = new OpenAI({ apiKey });
+    const model = process.env.OPENAI_MODEL || "gpt-5";
+
+    // Only include temperature for models that support it.
+    // gpt-5 requires default temperature (1) and rejects overrides.
+    const payload = {
+      model,
       messages: [{ role: "user", content: prompt }],
-      temperature: 0,
-    });
+    };
+    if (!/^gpt-5/i.test(model)) {
+      // Safer, more deterministic output for older models
+      payload.temperature = 0;
+    }
 
-    const newText = completion.choices?.[0]?.message?.content || "";
+    const completion = await client.chat.completions.create(payload);
 
+    let newText =
+      completion?.choices?.[0]?.message?.content?.trim() || "";
+
+    // Fallback: if model returned empty, do a conservative local replace
+    if (!newText) {
+      const phoneRegex = /(\+?\d[\d\s•\-().⇄⇋–_]{7,}\d)/g;
+      const normalize = (txt) =>
+        txt.replace(/[⇄⇋•–_]+/g, "-").replace(/\s{2,}/g, " ");
+      newText = normalize(originalText).replace(phoneRegex, newNumber);
+    }
+
+    // ---- Rebuild output PDF with Unicode font (fixes ℗/™/® issues)
     const pdfDoc = await PDFDocument.load(pdfData);
     pdfDoc.registerFontkit(fontkit);
 
     const fontRes = await fetch(FONT_URL, { cache: "no-store" });
-    if (!fontRes.ok) throw new Error(`Font download failed (${fontRes.status})`);
+    if (!fontRes.ok) {
+      throw new Error(`Font download failed (${fontRes.status})`);
+    }
     const fontBytes = new Uint8Array(await fontRes.arrayBuffer());
     const unicodeFont = await pdfDoc.embedFont(fontBytes, { subset: true });
 
     const page = pdfDoc.getPages()[0];
+
+    // Keep preview block modest to avoid text overflow on the page.
     const previewChunk = newText.slice(0, 1800);
 
     page.drawText(previewChunk, {
@@ -55,12 +102,16 @@ export default async function handler(req, res) {
     const outPdf = await pdfDoc.save();
     const base64 = Buffer.from(outPdf).toString("base64");
 
-    res.status(200).json({
+    return res.status(200).json({
       fileName: pdfUrl.split("/").pop(),
       preview: newText.substring(0, 500),
       downloadUrl: `data:application/pdf;base64,${base64}`,
     });
-  } catch (e) {
-    res.status(500).json({ error: e.message || String(e) });
+  } catch (err) {
+    // Helpful error for logs + user
+    console.error("aiProcess error:", err);
+    const msg =
+      typeof err?.message === "string" ? err.message : String(err);
+    return res.status(500).json({ error: msg });
   }
 }
